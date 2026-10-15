@@ -1091,6 +1091,32 @@ void attrs(std::uint32_t *rec, int n, const Vertex &v, bool fst, const Vertex *c
     rec[11] |= static_cast<std::uint32_t>(v.f) << (8 * n);
 }
 
+#ifndef __EMSCRIPTEN__
+// PS2_GPU_BACKEND pins one wgpu backend; unset or "primary" lets wgpu pick among the primary ones.
+WGPUInstanceBackend requested_backends() {
+    const char *name = std::getenv("PS2_GPU_BACKEND");
+    if (!name || !std::strcmp(name, "primary")) return WGPUInstanceBackend_Primary;
+    if (!std::strcmp(name, "vulkan")) return WGPUInstanceBackend_Vulkan;
+    if (!std::strcmp(name, "dx12")) return WGPUInstanceBackend_DX12;
+    if (!std::strcmp(name, "gl")) return WGPUInstanceBackend_GL;
+    std::fprintf(stderr, "[gpu] unknown PS2_GPU_BACKEND %s, using primary\n", name);
+    return WGPUInstanceBackend_Primary;
+}
+#endif
+
+const char *backend_name(WGPUBackendType type) {
+    switch (type) {
+    case WGPUBackendType_Vulkan: return "Vulkan";
+    case WGPUBackendType_D3D12: return "D3D12";
+    case WGPUBackendType_D3D11: return "D3D11";
+    case WGPUBackendType_Metal: return "Metal";
+    case WGPUBackendType_OpenGL: return "OpenGL";
+    case WGPUBackendType_OpenGLES: return "OpenGL ES";
+    case WGPUBackendType_WebGPU: return "WebGPU";
+    default: return "unknown";
+    }
+}
+
 }
 
 Mode mode() { return g_mode; }
@@ -1102,7 +1128,7 @@ bool init(Mode m) {
 #else
     WGPUInstanceExtras extras = {};
     extras.chain.sType = static_cast<WGPUSType>(WGPUSType_InstanceExtras);
-    extras.backends = WGPUInstanceBackend_Primary;
+    extras.backends = requested_backends();
     WGPUInstanceDescriptor id = WGPU_INSTANCE_DESCRIPTOR_INIT;
     id.nextInChain = &extras.chain;
     g_instance = wgpuCreateInstance(&id);
@@ -1129,7 +1155,7 @@ bool init(Mode m) {
     }
     WGPUAdapterInfo info = WGPU_ADAPTER_INFO_INIT;
     if (wgpuAdapterGetInfo(adapter, &info) == WGPUStatus_Success) {
-        std::fprintf(stderr, "[gpu] %.*s (%.*s)\n", static_cast<int>(info.device.length), info.device.data, static_cast<int>(info.description.length), info.description.data);
+        std::fprintf(stderr, "[gpu] %.*s (%.*s), %s backend\n", static_cast<int>(info.device.length), info.device.data, static_cast<int>(info.description.length), info.description.data, backend_name(info.backendType));
         wgpuAdapterInfoFreeMembers(info);
     }
     WGPULimits supported = WGPU_LIMITS_INIT;
