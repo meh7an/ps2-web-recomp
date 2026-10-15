@@ -1665,6 +1665,7 @@ bool attach_surface(const SurfaceTarget &target) {
 #else
     WGPUSurfaceSourceXlibWindow xlib = WGPU_SURFACE_SOURCE_XLIB_WINDOW_INIT;
     WGPUSurfaceSourceWaylandSurface wayland = WGPU_SURFACE_SOURCE_WAYLAND_SURFACE_INIT;
+    WGPUSurfaceSourceWindowsHWND win32 = WGPU_SURFACE_SOURCE_WINDOWS_HWND_INIT;
     if (target.kind == SurfaceTarget::X11) {
         xlib.display = target.display;
         xlib.window = target.window;
@@ -1673,6 +1674,10 @@ bool attach_surface(const SurfaceTarget &target) {
         wayland.display = target.display;
         wayland.surface = target.surface;
         sd.nextInChain = &wayland.chain;
+    } else if (target.kind == SurfaceTarget::Win32) {
+        win32.hinstance = target.display;
+        win32.hwnd = reinterpret_cast<void *>(static_cast<std::uintptr_t>(target.window));
+        sd.nextInChain = &win32.chain;
     } else {
         return false;
     }

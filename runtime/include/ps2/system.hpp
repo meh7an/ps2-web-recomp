@@ -82,7 +82,8 @@ std::uint64_t frame_count();
 bool display_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
 
 struct WindowTarget {
-    enum Kind { X11, Wayland, Canvas } kind = X11;
+    // Win32 carries the HINSTANCE in display and the HWND in window.
+    enum Kind { X11, Wayland, Canvas, Win32 } kind = X11;
     void *display = nullptr;
     std::uint64_t window = 0;
     void *surface = nullptr;

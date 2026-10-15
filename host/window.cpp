@@ -98,6 +98,13 @@ bool attach_gpu() {
         target.surface = info.info.wl.surface;
         break;
 #endif
+#if defined(SDL_VIDEO_DRIVER_WINDOWS)
+    case SDL_SYSWM_WINDOWS:
+        target.kind = ps2::WindowTarget::Win32;
+        target.display = info.info.win.hinstance;
+        target.window = reinterpret_cast<std::uintptr_t>(info.info.win.window);
+        break;
+#endif
     default: return false;
     }
     return ps2::attach_window(target);
