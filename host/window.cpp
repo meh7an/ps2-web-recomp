@@ -4,8 +4,13 @@
 
 #include <SDL.h>
 #include <SDL_syswm.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#else
 #include <sys/resource.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -263,18 +268,32 @@ void pace() {
 }
 
 double process_cpu_seconds() {
+#ifdef _WIN32
+    FILETIME created, exited, kernel, user;
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 0.0;
+    // FILETIME counts 100 ns ticks.
+    const auto ticks = [](const FILETIME &t) { return (static_cast<std::uint64_t>(t.dwHighDateTime) << 32) | t.dwLowDateTime; };
+    return static_cast<double>(ticks(kernel) + ticks(user)) / 1e7;
+#else
     rusage usage{};
     getrusage(RUSAGE_SELF, &usage);
     return static_cast<double>(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) + static_cast<double>(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e6;
+#endif
 }
 
 double resident_mb() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS counters{};
+    if (!K32GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof counters)) return 0.0;
+    return static_cast<double>(counters.WorkingSetSize) / (1024.0 * 1024.0);
+#else
     long pages = 0, resident = 0;
     if (std::FILE *f = std::fopen("/proc/self/statm", "r")) {
         if (std::fscanf(f, "%ld %ld", &pages, &resident) != 2) resident = 0;
         std::fclose(f);
     }
     return static_cast<double>(resident) * static_cast<double>(sysconf(_SC_PAGESIZE)) / (1024.0 * 1024.0);
+#endif
 }
 
 void show_speed() {
