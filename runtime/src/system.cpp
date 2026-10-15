@@ -54,6 +54,12 @@ bool g_halted = false;
 std::string g_halt_reason;
 std::uint64_t g_frames = 0;
 std::uint64_t g_iop_synced = 0;
+// Host time spent running the IOP, which shares the emulation thread; only that thread writes it.
+// request_iop_sync() can make catch-ups so frequent that timing each one costs more than the IOP
+// itself, so one catch-up in kIopSampleEvery is timed and counted that many times.
+constexpr std::uint64_t kIopSampleEvery = 64;
+std::uint64_t g_iop_catch_ups = 0;
+std::atomic<double> g_iop_ms{0.0};
 bool g_state_request = false;
 bool g_resumed = false;
 
@@ -335,7 +341,14 @@ bool load_elf(const std::string &path, std::uint32_t &entry) {
 void sync_iop() {
     const std::uint64_t t = now();
     if (t > g_iop_synced) {
-        iop::run(t - g_iop_synced);
+        if (++g_iop_catch_ups % kIopSampleEvery == 0) {
+            const auto start = std::chrono::steady_clock::now();
+            iop::run(t - g_iop_synced);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            g_iop_ms.store(g_iop_ms.load(std::memory_order_relaxed) + ms * kIopSampleEvery, std::memory_order_relaxed);
+        } else {
+            iop::run(t - g_iop_synced);
+        }
         g_iop_synced = t;
     }
     sif::pump();
@@ -436,6 +449,7 @@ void start_vu_thread() { gs::queue::vu().start(32u << 20); }
 std::atomic<double> g_vu_idle_ms{0.0};
 
 double vu_thread_idle_ms() { return g_vu_idle_ms.load(); }
+double iop_busy_ms() { return g_iop_ms.load(std::memory_order_relaxed); }
 std::uint64_t vu1_interpreted_calls() { return vu::interpreted_calls(); }
 
 void run_vu_thread() {
