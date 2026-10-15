@@ -535,6 +535,10 @@ void finish_audio() {
 }
 
 bool open_window(bool fullscreen) {
+    // Over Bluetooth, DualShock 4 and DualSense pads rumble only in SDL's enhanced report mode,
+    // which these hints allow; over USB they always rumble.
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
         std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
         return false;
