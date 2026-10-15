@@ -353,7 +353,12 @@ void boot(std::uint32_t entry, const std::vector<std::string> &args) {
     iop::set_trace(g_options.trace_iop_modules, g_options.trace_iop_hle);
     iop::reset();
     std::vector<std::string> guest_args = args;
-    if (!guest_args.empty() && guest_args[0].find(':') == std::string::npos) {
+    // A Windows path's drive letter (C:\ or C:/) is not a PS2 device, so it is a host path too.
+    const auto host_path = [](const std::string &a) {
+        const bool drive = a.size() > 2 && std::isalpha(static_cast<unsigned char>(a[0])) && a[1] == ':' && (a[2] == '\\' || a[2] == '/');
+        return drive || a.find(':') == std::string::npos;
+    };
+    if (!guest_args.empty() && host_path(guest_args[0])) {
         std::string name = guest_args[0].substr(guest_args[0].find_last_of("/\\") + 1);
         for (char &ch : name) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
         guest_args[0] = "cdrom0:\\" + name + ";1";
