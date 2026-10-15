@@ -92,10 +92,12 @@ int main(int argc, char **argv) {
         if (profile) start_profile(profile_from ? std::strtoull(profile_from, nullptr, 10) : 0);
         const int result = ps2::run();
         if (profile) write_profile(profile);
-        return result;
 #else
-        return ps2::run();
+        const int result = ps2::run();
 #endif
+        // Interpreted VU1 calls are programs no build has compiled yet; PS2_VU_RECORD saves them.
+        std::fprintf(stderr, "[vu1] %llu interpreted calls\n", static_cast<unsigned long long>(ps2::vu1_interpreted_calls()));
+        return result;
     };
 #ifdef PS2_WINDOW
     if (window) return run_window(emulate);
