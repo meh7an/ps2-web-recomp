@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <thread>
 #include <vector>
 
@@ -248,12 +249,51 @@ void present() {
     if (ps2::display_frame(g_pixels, w, h)) show_pixels(g_pixels.data(), w, h);
 }
 
-constexpr Uint32 kAudioBytesPerMs = 48 * 4;
+// The SPU2 writes this ring on the emulation thread and SDL's callback reads it, as in host/web.cpp.
+// The callback counts every gap it fills with silence, so underruns are measured, not guessed.
+constexpr std::uint32_t kAudioRate = 48000;
+constexpr std::uint32_t kAudioFrames = 1u << 14;
+constexpr std::uint32_t kAudioTarget = 80 * kAudioRate / 1000;
+
+struct AudioRing {
+    std::atomic<std::uint32_t> write{0}, read{0};
+    std::atomic<std::uint64_t> underruns{0}, silent_frames{0}, dropped_frames{0};
+    std::int16_t samples[kAudioFrames * 2];
+};
+
+AudioRing g_ring;
+bool g_audio_playing = false;
+
+std::uint32_t audio_queued() { return g_ring.write.load(std::memory_order_acquire) - g_ring.read.load(std::memory_order_acquire); }
+
+double frames_to_ms(std::uint64_t frames) { return static_cast<double>(frames) * 1000.0 / kAudioRate; }
+
+void SDLCALL play_audio(void *, Uint8 *stream, int len) {
+    auto *out = reinterpret_cast<std::int16_t *>(stream);
+    const std::uint32_t wanted = static_cast<std::uint32_t>(len) / 4;
+    std::uint32_t read = g_ring.read.load(std::memory_order_relaxed);
+    const std::uint32_t taken = std::min(wanted, g_ring.write.load(std::memory_order_acquire) - read);
+    for (std::uint32_t i = 0; i < taken; ++i, ++read) {
+        const std::uint32_t at = (read & (kAudioFrames - 1)) * 2;
+        out[i * 2] = g_ring.samples[at];
+        out[i * 2 + 1] = g_ring.samples[at + 1];
+    }
+    g_ring.read.store(read, std::memory_order_release);
+    if (taken == wanted) return;
+    std::memset(out + taken * 2, 0, (wanted - taken) * 4u);
+    g_ring.underruns.fetch_add(1, std::memory_order_relaxed);
+    g_ring.silent_frames.fetch_add(wanted - taken, std::memory_order_relaxed);
+}
 
 void pace() {
     if (g_audio) {
+        // Playback starts once the target is queued, so the wait before the first samples is no underrun.
+        if (!g_audio_playing && audio_queued() >= kAudioTarget) {
+            g_audio_playing = true;
+            SDL_PauseAudioDevice(g_audio, 0);
+        }
         // The audio device clock paces emulation: wait while more than ~80 ms of sound is queued.
-        while (SDL_GetQueuedAudioSize(g_audio) > 80 * kAudioBytesPerMs) SDL_Delay(1);
+        while (audio_queued() > kAudioTarget) SDL_Delay(1);
         return;
     }
     const std::uint64_t frequency = SDL_GetPerformanceFrequency();
@@ -310,7 +350,7 @@ void show_speed() {
     if (seconds < 1.0) return;
     const double cpu = process_cpu_seconds(), gpu = ps2::gpu_busy_ms();
     char title[192];
-    const double queued = g_audio ? SDL_GetQueuedAudioSize(g_audio) / static_cast<double>(kAudioBytesPerMs) : 0.0;
+    const double queued = g_audio ? frames_to_ms(audio_queued()) : 0.0;
     std::snprintf(title, sizeof title, "ps2-web-recomp  %.1f fps  CPU %.0f%%  GPU %.0f%%  RAM %.0f MB  audio %.0f ms", static_cast<double>(frames) / seconds,
                   (cpu - cpu_start) / seconds * 100.0, (gpu - gpu_start) / (seconds * 10.0), resident_mb(), queued);
     SDL_SetWindowTitle(g_window, title);
@@ -328,8 +368,24 @@ void on_vblank() {
 }
 
 void queue_audio(const std::int16_t *samples, std::size_t frames) {
-    if (SDL_GetQueuedAudioSize(g_audio) > 500 * kAudioBytesPerMs) return;
-    SDL_QueueAudio(g_audio, samples, static_cast<Uint32>(frames * 4));
+    std::uint32_t write = g_ring.write.load(std::memory_order_relaxed);
+    const std::uint32_t room = kAudioFrames - (write - g_ring.read.load(std::memory_order_acquire));
+    const std::uint32_t taken = static_cast<std::uint32_t>(std::min<std::size_t>(frames, room));
+    for (std::uint32_t i = 0; i < taken; ++i, ++write) {
+        const std::uint32_t at = (write & (kAudioFrames - 1)) * 2;
+        g_ring.samples[at] = samples[i * 2];
+        g_ring.samples[at + 1] = samples[i * 2 + 1];
+    }
+    g_ring.write.store(write, std::memory_order_release);
+    if (taken < frames) g_ring.dropped_frames.fetch_add(frames - taken, std::memory_order_relaxed);
+}
+
+// Pausing first keeps the drained ring after the last frame from counting as an underrun.
+void finish_audio() {
+    if (!g_audio) return;
+    SDL_PauseAudioDevice(g_audio, 1);
+    std::fprintf(stderr, "[audio] underruns=%llu silence_ms=%.1f dropped_ms=%.1f\n", static_cast<unsigned long long>(g_ring.underruns.load()),
+                 frames_to_ms(g_ring.silent_frames.load()), frames_to_ms(g_ring.dropped_frames.load()));
 }
 
 }
@@ -351,9 +407,11 @@ bool open_window(bool fullscreen) {
     want.format = AUDIO_S16SYS;
     want.channels = 2;
     want.samples = 1024;
+    want.callback = play_audio;
+    // The device opens paused; pace() starts it once enough sound is queued.
     g_audio = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
     if (g_audio) {
-        SDL_PauseAudioDevice(g_audio, 0);
+        std::fprintf(stderr, "[audio] %d Hz, %d channels, %d frames per callback\n", have.freq, have.channels, have.samples);
         ps2::set_audio_sink(queue_audio);
     }
     for (int i = 0; i < SDL_NumJoysticks(); ++i)
@@ -370,7 +428,9 @@ int run_window(const std::function<int()> &emulate) {
     const bool threads = !std::getenv("PS2_ONE_THREAD") && !std::getenv("PS2_TIME") && ps2::g_options.frames_dir.empty();
     if (!threads) {
         ps2::g_options.on_vblank = on_vblank;
-        return emulate();
+        const int result = emulate();
+        finish_audio();
+        return result;
     }
     ps2::g_options.on_vblank = [] {
         ps2::post_present();
@@ -394,6 +454,7 @@ int run_window(const std::function<int()> &emulate) {
         if (ps2::render_pending(g_gpu_present, g_gpu_present ? none : copy, show_speed, 8.0) == ps2::Rendered::idle) ps2::wait_render_work(4);
     }
     emulation.join();
+    finish_audio();
     SDL_Quit();
     std::fflush(nullptr);
     std::_Exit(result);
