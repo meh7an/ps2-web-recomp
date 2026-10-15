@@ -6,6 +6,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(PS2_GENERATED "" CACHE PATH "Folder with the C++ generated for a game")
 
+# clang-cl reads -Wall as /Wall, which is -Weverything; its /W4 is -Wall -Wextra.
+if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    set(PS2_WARNINGS /W4)
+else()
+    set(PS2_WARNINGS -Wall -Wextra)
+endif()
+if(WIN32)
+    # The MSVC CRT marks portable C functions such as getenv and fopen deprecated.
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+endif()
+
 if(EMSCRIPTEN)
     add_compile_options(-msimd128 -mtail-call -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0 -pthread)
     add_link_options(-msimd128 -mtail-call -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0 -pthread)
@@ -19,13 +30,13 @@ if(NOT EMSCRIPTEN)
         recomp/analysis.cpp
         recomp/codegen.cpp
         recomp/snr2.cpp)
-    target_compile_options(eerecomp PRIVATE -Wall -Wextra)
+    target_compile_options(eerecomp PRIVATE ${PS2_WARNINGS})
 
     add_executable(vujit_dump recomp/vujit_dump.cpp runtime/src/vu_jit.cpp)
     target_include_directories(vujit_dump PRIVATE runtime/include runtime/src)
     add_executable(vurecomp recomp/vurecomp.cpp)
     target_include_directories(vurecomp PRIVATE runtime/include)
-    target_compile_options(vurecomp PRIVATE -Wall -Wextra)
+    target_compile_options(vurecomp PRIVATE ${PS2_WARNINGS})
 endif()
 
 add_library(ps2runtime STATIC
@@ -57,7 +68,7 @@ add_library(ps2runtime STATIC
     runtime/src/iop/sif.cpp
     runtime/src/iop/cdvdfsv.cpp)
 target_include_directories(ps2runtime PUBLIC runtime/include)
-target_compile_options(ps2runtime PRIVATE -Wall -Wextra)
+target_compile_options(ps2runtime PRIVATE ${PS2_WARNINGS})
 
 set(PS2_WGPU_DIR "${CMAKE_SOURCE_DIR}/third_party/wgpu-native" CACHE PATH "wgpu-native release folder")
 if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
