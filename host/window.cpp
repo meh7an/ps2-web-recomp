@@ -189,6 +189,14 @@ void poll_port(int port) {
     ps2::set_pad_axis(3, state.ly, port);
 }
 
+// Only records the size: the GPU code rebuilds the swapchain to the newest one at most every
+// 100 ms, so this can run on every size event of a resize.
+void apply_window_size() {
+    int w = 0, h = 0;
+    SDL_GetWindowSizeInPixels(g_window, &w, &h);
+    ps2::resize_window(static_cast<std::uint32_t>(w), static_cast<std::uint32_t>(h));
+}
+
 void poll() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
@@ -198,11 +206,7 @@ void poll() {
             SDL_SetWindowFullscreen(g_window, full ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
             SDL_ShowCursor(full ? SDL_ENABLE : SDL_DISABLE);
         }
-        if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED && g_gpu_present) {
-            int w = 0, h = 0;
-            SDL_GetWindowSizeInPixels(g_window, &w, &h);
-            ps2::resize_window(static_cast<std::uint32_t>(w), static_cast<std::uint32_t>(h));
-        }
+        if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED && g_gpu_present) apply_window_size();
         if (e.type == SDL_CONTROLLERDEVICEADDED) open_pad(e.cdevice.which);
         if (e.type == SDL_CONTROLLERDEVICEREMOVED)
             for (SDL_GameController *&pad : g_pads)
@@ -517,6 +521,37 @@ void on_vblank() {
     report_stats();
 }
 
+// One pass of the threaded runner's GS render loop: a finished frame, or up to 8 ms of queued work.
+ps2::Rendered render_pass() {
+    static const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> copy = show_pixels, none;
+    static bool active = false;
+    if (active) return ps2::Rendered::busy;
+    active = true;
+    const ps2::Rendered rendered = ps2::render_pending(g_gpu_present, g_gpu_present ? none : copy, show_speed, 8.0);
+    active = false;
+    return rendered;
+}
+
+// Render passes run on exposed events, printed at exit. Inside Windows' move and size loops the
+// main thread never waits for work, so the gs time per frame says nothing about these passes.
+std::uint64_t g_exposed_passes = 0, g_exposed_presents = 0;
+double g_exposed_ms = 0.0;
+
+// Windows holds the main thread in its move and size loops. SDL's 10 ms timer keeps queuing exposed
+// events there, so rendering on each keeps the GS queue moving and the emulation running. Sizes are
+// passed on as they are queued, since poll() sees them only once the loop ends.
+int SDLCALL render_in_modal_loops(void *, SDL_Event *e) {
+    if (e->type != SDL_WINDOWEVENT) return 1;
+    if (e->window.event == SDL_WINDOWEVENT_SIZE_CHANGED && g_gpu_present) apply_window_size();
+    if (e->window.event == SDL_WINDOWEVENT_EXPOSED) {
+        const Clock::time_point start = Clock::now();
+        if (render_pass() == ps2::Rendered::presented) ++g_exposed_presents;
+        ++g_exposed_passes;
+        g_exposed_ms += ms_between(start, Clock::now());
+    }
+    return 1;
+}
+
 void queue_audio(const std::int16_t *samples, std::size_t frames) {
     std::uint32_t write = g_ring.write.load(std::memory_order_relaxed);
     const std::uint32_t room = kAudioFrames - (write - g_ring.read.load(std::memory_order_acquire));
@@ -607,15 +642,18 @@ int run_window(const std::function<int()> &emulate) {
         done.store(true);
         ps2::wake_render_thread();
     });
-    const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> copy = show_pixels, none;
+    SDL_AddEventWatch(render_in_modal_loops, nullptr);
     while (!done.load()) {
         poll();
-        if (ps2::render_pending(g_gpu_present, g_gpu_present ? none : copy, show_speed, 8.0) == ps2::Rendered::idle) {
+        if (render_pass() == ps2::Rendered::idle) {
             const Clock::time_point start = Clock::now();
             ps2::wait_render_work(4);
             add_ms(g_render_idle_ms, start);
         }
     }
+    SDL_DelEventWatch(render_in_modal_loops, nullptr);
+    std::fprintf(stderr, "[window] %llu render passes on exposed events in %.1f ms, %llu presents\n", static_cast<unsigned long long>(g_exposed_passes), g_exposed_ms,
+                 static_cast<unsigned long long>(g_exposed_presents));
     emulation.join();
     finish_audio();
     report_total();
