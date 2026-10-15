@@ -1,5 +1,6 @@
 #include "window.hpp"
 
+#include "input.hpp"
 #include "ps2/system.hpp"
 
 #include <SDL.h>
@@ -27,25 +28,19 @@
 
 namespace {
 
-enum Button : std::uint16_t {
-    kSelect = 1u << 0, kL3 = 1u << 1, kR3 = 1u << 2, kStart = 1u << 3,
-    kUp = 1u << 4, kRight = 1u << 5, kDown = 1u << 6, kLeft = 1u << 7,
-    kL2 = 1u << 8, kR2 = 1u << 9, kL1 = 1u << 10, kR1 = 1u << 11,
-    kTriangle = 1u << 12, kCircle = 1u << 13, kCross = 1u << 14, kSquare = 1u << 15,
-};
+namespace input = ps2::input;
 
-struct KeyBinding {
-    SDL_Scancode key;
-    std::uint16_t button;
-};
-
-constexpr KeyBinding kKeys[] = {
-    {SDL_SCANCODE_UP, kUp},         {SDL_SCANCODE_DOWN, kDown},     {SDL_SCANCODE_LEFT, kLeft},
-    {SDL_SCANCODE_RIGHT, kRight},   {SDL_SCANCODE_Z, kCross},       {SDL_SCANCODE_X, kCircle},
-    {SDL_SCANCODE_A, kSquare},      {SDL_SCANCODE_S, kTriangle},    {SDL_SCANCODE_Q, kL1},
-    {SDL_SCANCODE_W, kR1},          {SDL_SCANCODE_1, kL2},          {SDL_SCANCODE_2, kR2},
-    {SDL_SCANCODE_RETURN, kStart},  {SDL_SCANCODE_BACKSPACE, kSelect},
-};
+// The input module names keys by USB HID usage, as SDL's scancodes do; check each key it binds.
+constexpr bool same_key(input::Key key, SDL_Scancode code) { return static_cast<int>(key) == static_cast<int>(code); }
+static_assert(same_key(input::kKeyA, SDL_SCANCODE_A) && same_key(input::kKeyD, SDL_SCANCODE_D) && same_key(input::kKeyE, SDL_SCANCODE_E) &&
+              same_key(input::kKeyF, SDL_SCANCODE_F) && same_key(input::kKeyG, SDL_SCANCODE_G) && same_key(input::kKeyH, SDL_SCANCODE_H) &&
+              same_key(input::kKeyI, SDL_SCANCODE_I) && same_key(input::kKeyJ, SDL_SCANCODE_J) && same_key(input::kKeyK, SDL_SCANCODE_K) &&
+              same_key(input::kKeyL, SDL_SCANCODE_L) && same_key(input::kKeyQ, SDL_SCANCODE_Q) && same_key(input::kKeyS, SDL_SCANCODE_S) &&
+              same_key(input::kKeyT, SDL_SCANCODE_T) && same_key(input::kKeyW, SDL_SCANCODE_W) && same_key(input::kKey1, SDL_SCANCODE_1) &&
+              same_key(input::kKey2, SDL_SCANCODE_2) && same_key(input::kKey3, SDL_SCANCODE_3) && same_key(input::kKey4, SDL_SCANCODE_4) &&
+              same_key(input::kKeyReturn, SDL_SCANCODE_RETURN) && same_key(input::kKeyBackspace, SDL_SCANCODE_BACKSPACE) &&
+              same_key(input::kKeyRight, SDL_SCANCODE_RIGHT) && same_key(input::kKeyLeft, SDL_SCANCODE_LEFT) &&
+              same_key(input::kKeyDown, SDL_SCANCODE_DOWN) && same_key(input::kKeyUp, SDL_SCANCODE_UP));
 
 struct PadBinding {
     SDL_GameControllerButton button;
@@ -53,14 +48,18 @@ struct PadBinding {
 };
 
 constexpr PadBinding kPadButtons[] = {
-    {SDL_CONTROLLER_BUTTON_A, kCross},          {SDL_CONTROLLER_BUTTON_B, kCircle},
-    {SDL_CONTROLLER_BUTTON_X, kSquare},         {SDL_CONTROLLER_BUTTON_Y, kTriangle},
-    {SDL_CONTROLLER_BUTTON_LEFTSHOULDER, kL1},  {SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, kR1},
-    {SDL_CONTROLLER_BUTTON_LEFTSTICK, kL3},     {SDL_CONTROLLER_BUTTON_RIGHTSTICK, kR3},
-    {SDL_CONTROLLER_BUTTON_BACK, kSelect},      {SDL_CONTROLLER_BUTTON_START, kStart},
-    {SDL_CONTROLLER_BUTTON_DPAD_UP, kUp},       {SDL_CONTROLLER_BUTTON_DPAD_DOWN, kDown},
-    {SDL_CONTROLLER_BUTTON_DPAD_LEFT, kLeft},   {SDL_CONTROLLER_BUTTON_DPAD_RIGHT, kRight},
+    {SDL_CONTROLLER_BUTTON_A, input::kCross},          {SDL_CONTROLLER_BUTTON_B, input::kCircle},
+    {SDL_CONTROLLER_BUTTON_X, input::kSquare},         {SDL_CONTROLLER_BUTTON_Y, input::kTriangle},
+    {SDL_CONTROLLER_BUTTON_LEFTSHOULDER, input::kL1},  {SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, input::kR1},
+    {SDL_CONTROLLER_BUTTON_LEFTSTICK, input::kL3},     {SDL_CONTROLLER_BUTTON_RIGHTSTICK, input::kR3},
+    {SDL_CONTROLLER_BUTTON_BACK, input::kSelect},      {SDL_CONTROLLER_BUTTON_START, input::kStart},
+    {SDL_CONTROLLER_BUTTON_DPAD_UP, input::kUp},       {SDL_CONTROLLER_BUTTON_DPAD_DOWN, input::kDown},
+    {SDL_CONTROLLER_BUTTON_DPAD_LEFT, input::kLeft},   {SDL_CONTROLLER_BUTTON_DPAD_RIGHT, input::kRight},
 };
+
+// No mouse button is bound by default: GoW2 has no camera to aim (spec 011).
+constexpr std::span<const input::MouseBinding> kMouseButtons{};
+constexpr input::Settings kInputSettings{};
 
 SDL_Window *g_window = nullptr;
 SDL_Renderer *g_renderer = nullptr;
@@ -120,11 +119,6 @@ bool attach_gpu() {
     return ps2::attach_window(target);
 }
 
-std::uint8_t axis(SDL_GameController *pad, SDL_GameControllerAxis a) {
-    const int v = SDL_GameControllerGetAxis(pad, a);
-    return static_cast<std::uint8_t>(std::clamp((v + 32768) >> 8, 0, 255));
-}
-
 void rumble(int port) {
     static double last_strong[2] = {};
     static bool last_weak[2] = {};
@@ -161,47 +155,38 @@ void poll_port(int port) {
         plugged[port] = pad != nullptr;
         ps2::set_pad_connected(port, plugged[port]);
     }
-    std::uint16_t pressed = 0;
-    std::uint8_t l2 = 0xFF, r2 = 0xFF;
-    std::uint8_t lx = 0x80, ly = 0x80, rx = 0x80, ry = 0x80;
+    input::Held held;
     if (port == 0) {
-        const Uint8 *keys = SDL_GetKeyboardState(nullptr);
-        for (const KeyBinding &b : kKeys)
-            if (keys[b.key]) pressed |= b.button;
-        if (keys[SDL_SCANCODE_LEFT]) lx = 0x00;
-        if (keys[SDL_SCANCODE_RIGHT]) lx = 0xFF;
-        if (keys[SDL_SCANCODE_UP]) ly = 0x00;
-        if (keys[SDL_SCANCODE_DOWN]) ly = 0xFF;
+        int count = 0;
+        const Uint8 *keys = SDL_GetKeyboardState(&count);
+        held.digital = input::from_keys(keys, static_cast<std::size_t>(count), input::kDefaultKeys);
+        held.digital |= input::from_mouse(SDL_GetMouseState(nullptr, nullptr), kMouseButtons);
     }
     if (pad) {
         for (const PadBinding &b : kPadButtons)
-            if (SDL_GameControllerGetButton(pad, b.button)) pressed |= b.mask;
-        const auto trigger = [&](SDL_GameControllerAxis a, std::uint16_t bit, std::uint8_t &pressure) {
-            const int v = SDL_GameControllerGetAxis(pad, a);
-            if (v <= 2000 || (pressed & bit)) return;
-            pressed |= bit;
-            pressure = static_cast<std::uint8_t>(std::max(1, v * 255 / 32767));
-        };
-        trigger(SDL_CONTROLLER_AXIS_TRIGGERLEFT, kL2, l2);
-        trigger(SDL_CONTROLLER_AXIS_TRIGGERRIGHT, kR2, r2);
-        if (lx == 0x80) lx = axis(pad, SDL_CONTROLLER_AXIS_LEFTX);
-        if (ly == 0x80) ly = axis(pad, SDL_CONTROLLER_AXIS_LEFTY);
-        rx = axis(pad, SDL_CONTROLLER_AXIS_RIGHTX);
-        ry = axis(pad, SDL_CONTROLLER_AXIS_RIGHTY);
+            if (SDL_GameControllerGetButton(pad, b.button)) held.digital.buttons |= b.mask;
+        held.controller = true;
+        held.left_x = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX);
+        held.left_y = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY);
+        held.right_x = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTX);
+        held.right_y = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTY);
+        held.left_trigger = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
+        held.right_trigger = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
     }
     rumble(port);
-    static std::uint64_t last[2] = {~0ull, ~0ull};
-    const std::uint64_t state = pressed | (static_cast<std::uint64_t>(rx) << 16) | (static_cast<std::uint64_t>(ry) << 24) | (static_cast<std::uint64_t>(lx) << 32) |
-                                (static_cast<std::uint64_t>(ly) << 40) | (static_cast<std::uint64_t>(l2) << 48) | (static_cast<std::uint64_t>(r2) << 56);
-    if (state == last[port]) return;
+    static input::PadState last[2];
+    static bool sent[2] = {};
+    const input::PadState state = input::resolve(held, kInputSettings);
+    if (sent[port] && state == last[port]) return;
+    sent[port] = true;
     last[port] = state;
-    ps2::set_pad_pressure(8, l2, port);
-    ps2::set_pad_pressure(9, r2, port);
-    ps2::set_pad_buttons(pressed, port);
-    ps2::set_pad_axis(0, rx, port);
-    ps2::set_pad_axis(1, ry, port);
-    ps2::set_pad_axis(2, lx, port);
-    ps2::set_pad_axis(3, ly, port);
+    ps2::set_pad_pressure(8, state.l2, port);
+    ps2::set_pad_pressure(9, state.r2, port);
+    ps2::set_pad_buttons(state.buttons, port);
+    ps2::set_pad_axis(0, state.rx, port);
+    ps2::set_pad_axis(1, state.ry, port);
+    ps2::set_pad_axis(2, state.lx, port);
+    ps2::set_pad_axis(3, state.ly, port);
 }
 
 void poll() {
