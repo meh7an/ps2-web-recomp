@@ -365,7 +365,7 @@ void add_ms(std::atomic<double> &total, Clock::time_point since) {
 // The cumulative counters at one moment; statistics are differences between two samples.
 struct Sample {
     Clock::time_point at;
-    std::uint64_t frame = 0, presents = 0, underruns = 0, silent = 0, dropped = 0;
+    std::uint64_t frame = 0, presents = 0, underruns = 0, silent = 0, dropped = 0, vu1_interp = 0;
     double emulation_idle = 0.0, render_idle = 0.0, vu_idle = 0.0, iop = 0.0, gpu = 0.0, cpu = 0.0;
 };
 
@@ -383,6 +383,7 @@ Sample sample() {
     s.iop = ps2::iop_busy_ms();
     s.gpu = g_gpu_ms.load(std::memory_order_relaxed);
     s.cpu = process_cpu_seconds();
+    s.vu1_interp = ps2::vu1_interpreted_calls();
     return s;
 }
 
@@ -404,6 +405,8 @@ Spread spread(std::vector<float> values) {
 struct Stats {
     std::uint64_t frame = 0, underruns = 0;
     double fps = 0.0, shown = 0.0, ee = 0.0, iop = 0.0, vu1 = 0.0, gs = 0.0, gpu = 0.0, cpu = 0.0, silence_ms = 0.0, dropped_ms = 0.0;
+    // VU1 programs with no compiled match run on the interpreter; these count its entries.
+    double vu1_interp = 0.0, vu1_interp_per_second = 0.0;
     Spread frame_ms, present_ms;
 };
 
@@ -426,6 +429,8 @@ Stats measure(const Sample &from, const Sample &to, std::vector<float> vblanks, 
     s.underruns = to.underruns - from.underruns;
     s.silence_ms = frames_to_ms(to.silent - from.silent);
     s.dropped_ms = frames_to_ms(to.dropped - from.dropped);
+    s.vu1_interp = static_cast<double>(to.vu1_interp - from.vu1_interp) / frames;
+    s.vu1_interp_per_second = static_cast<double>(to.vu1_interp - from.vu1_interp) * 1000.0 / wall;
     return s;
 }
 
@@ -433,10 +438,10 @@ void print_stats(const char *label, const Stats &s) {
     char audio[16] = "none";
     if (g_audio) std::snprintf(audio, sizeof audio, "%.0f", frames_to_ms(audio_queued()));
     std::fprintf(stderr,
-                 "[stats] %sframe=%llu fps=%.1f shown=%.1f frame_ms=%.2f/%.2f/%.2f present_ms=%.2f/%.2f/%.2f ee=%.2f iop=%.2f vu1=%.2f gs=%.2f gpu=%.2f audio_ms=%s "
-                 "underruns=%llu silence_ms=%.1f dropped_ms=%.1f\n",
+                 "[stats] %sframe=%llu fps=%.1f shown=%.1f frame_ms=%.2f/%.2f/%.2f present_ms=%.2f/%.2f/%.2f ee=%.2f iop=%.2f vu1=%.2f gs=%.2f gpu=%.2f "
+                 "vu1_interp=%.2f audio_ms=%s underruns=%llu silence_ms=%.1f dropped_ms=%.1f\n",
                  label, static_cast<unsigned long long>(s.frame), s.fps, s.shown, s.frame_ms.mean, s.frame_ms.p99, s.frame_ms.max, s.present_ms.mean, s.present_ms.p99,
-                 s.present_ms.max, s.ee, s.iop, s.vu1, s.gs, s.gpu, audio, static_cast<unsigned long long>(s.underruns), s.silence_ms, s.dropped_ms);
+                 s.present_ms.max, s.ee, s.iop, s.vu1, s.gs, s.gpu, s.vu1_interp, audio, static_cast<unsigned long long>(s.underruns), s.silence_ms, s.dropped_ms);
 }
 
 // The emulation thread writes the title once a second; show_speed sets it on the window's thread.
@@ -445,8 +450,9 @@ std::string g_title;
 
 void publish_title(const Stats &s) {
     char title[256];
-    std::snprintf(title, sizeof title, "ps2-web-recomp  %.1f fps  EE %.1f  IOP %.1f  VU1 %.1f  GS %.1f  GPU %.1f ms  CPU %.0f%%  RAM %.0f MB  audio %.0f ms  underruns %llu", s.fps,
-                  s.ee, s.iop, s.vu1, s.gs, s.gpu, s.cpu, resident_mb(), g_audio ? frames_to_ms(audio_queued()) : 0.0,
+    std::snprintf(title, sizeof title,
+                  "ps2-web-recomp  %.1f fps  EE %.1f  IOP %.1f  VU1 %.1f  GS %.1f  GPU %.1f ms  VU1 interpreted %.0f/s  CPU %.0f%%  RAM %.0f MB  audio %.0f ms  underruns %llu",
+                  s.fps, s.ee, s.iop, s.vu1, s.gs, s.gpu, s.vu1_interp_per_second, s.cpu, resident_mb(), g_audio ? frames_to_ms(audio_queued()) : 0.0,
                   static_cast<unsigned long long>(g_ring.underruns.load(std::memory_order_relaxed)));
     const std::lock_guard<std::mutex> hold(g_title_lock);
     g_title = title;
