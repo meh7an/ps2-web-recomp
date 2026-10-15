@@ -14,11 +14,15 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -336,35 +340,190 @@ double resident_mb() {
 #endif
 }
 
-void show_speed() {
-    static std::uint64_t start = 0, frames = 0;
-    static double cpu_start = 0.0, gpu_start = 0.0;
-    const std::uint64_t now = SDL_GetPerformanceCounter();
-    if (!start) {
-        start = now;
-        cpu_start = process_cpu_seconds();
-        gpu_start = ps2::gpu_busy_ms();
+using Clock = std::chrono::steady_clock;
+
+double ms_between(Clock::time_point from, Clock::time_point to) { return std::chrono::duration<double, std::milli>(to - from).count(); }
+
+// Intervals between marks made on one thread, collected by the statistics on another.
+struct Intervals {
+    std::mutex lock;
+    std::vector<float> fresh;
+    Clock::time_point last{};
+    std::uint64_t count = 0;
+
+    void mark() {
+        const Clock::time_point now = Clock::now();
+        const std::lock_guard<std::mutex> hold(lock);
+        if (count++) fresh.push_back(static_cast<float>(ms_between(last, now)));
+        last = now;
     }
-    ++frames;
-    const double seconds = static_cast<double>(now - start) / static_cast<double>(SDL_GetPerformanceFrequency());
-    if (seconds < 1.0) return;
-    const double cpu = process_cpu_seconds(), gpu = ps2::gpu_busy_ms();
-    char title[192];
-    const double queued = g_audio ? frames_to_ms(audio_queued()) : 0.0;
-    std::snprintf(title, sizeof title, "ps2-web-recomp  %.1f fps  CPU %.0f%%  GPU %.0f%%  RAM %.0f MB  audio %.0f ms", static_cast<double>(frames) / seconds,
-                  (cpu - cpu_start) / seconds * 100.0, (gpu - gpu_start) / (seconds * 10.0), resident_mb(), queued);
-    SDL_SetWindowTitle(g_window, title);
-    start = now;
-    frames = 0;
-    cpu_start = cpu;
-    gpu_start = gpu;
+    std::vector<float> take() {
+        const std::lock_guard<std::mutex> hold(lock);
+        return std::exchange(fresh, {});
+    }
+    std::uint64_t marks() {
+        const std::lock_guard<std::mutex> hold(lock);
+        return count;
+    }
+};
+
+Intervals g_vblanks, g_presents;
+std::atomic<double> g_emulation_idle_ms{0.0}, g_render_idle_ms{0.0};
+// gpu_busy_ms reads counters the presenting thread owns, so that thread copies it here.
+std::atomic<double> g_gpu_ms{0.0};
+bool g_threads = false, g_vu_thread = false;
+
+void add_ms(std::atomic<double> &total, Clock::time_point since) {
+    total.store(total.load(std::memory_order_relaxed) + ms_between(since, Clock::now()), std::memory_order_relaxed);
+}
+
+// The cumulative counters at one moment; statistics are differences between two samples.
+struct Sample {
+    Clock::time_point at;
+    std::uint64_t frame = 0, presents = 0, underruns = 0, silent = 0, dropped = 0;
+    double emulation_idle = 0.0, render_idle = 0.0, vu_idle = 0.0, iop = 0.0, gpu = 0.0, cpu = 0.0;
+};
+
+Sample sample() {
+    Sample s;
+    s.at = Clock::now();
+    s.frame = ps2::frame_count();
+    s.presents = g_presents.marks();
+    s.underruns = g_ring.underruns.load(std::memory_order_relaxed);
+    s.silent = g_ring.silent_frames.load(std::memory_order_relaxed);
+    s.dropped = g_ring.dropped_frames.load(std::memory_order_relaxed);
+    s.emulation_idle = g_emulation_idle_ms.load(std::memory_order_relaxed);
+    s.render_idle = g_render_idle_ms.load(std::memory_order_relaxed);
+    s.vu_idle = ps2::vu_thread_idle_ms();
+    s.iop = ps2::iop_busy_ms();
+    s.gpu = g_gpu_ms.load(std::memory_order_relaxed);
+    s.cpu = process_cpu_seconds();
+    return s;
+}
+
+struct Spread {
+    double mean = 0.0, p99 = 0.0, max = 0.0;
+};
+
+Spread spread(std::vector<float> values) {
+    if (values.empty()) return {};
+    std::sort(values.begin(), values.end());
+    double sum = 0.0;
+    for (const float v : values) sum += v;
+    const std::size_t p99 = (values.size() * 99 + 99) / 100 - 1;
+    return {sum / static_cast<double>(values.size()), values[p99], values.back()};
+}
+
+// Rates per second, intervals in ms, and each thread's busy ms per emulated frame. Without the
+// threaded runner the GS works on the emulation thread, and without a VU thread so does VU1.
+struct Stats {
+    std::uint64_t frame = 0, underruns = 0;
+    double fps = 0.0, shown = 0.0, ee = 0.0, iop = 0.0, vu1 = 0.0, gs = 0.0, gpu = 0.0, cpu = 0.0, silence_ms = 0.0, dropped_ms = 0.0;
+    Spread frame_ms, present_ms;
+};
+
+Stats measure(const Sample &from, const Sample &to, std::vector<float> vblanks, std::vector<float> presents) {
+    Stats s;
+    const double wall = std::max(ms_between(from.at, to.at), 1e-3);
+    const double frames = static_cast<double>(std::max<std::uint64_t>(to.frame - from.frame, 1));
+    const double iop = to.iop - from.iop;
+    s.frame = to.frame;
+    s.fps = static_cast<double>(to.frame - from.frame) * 1000.0 / wall;
+    s.shown = static_cast<double>(to.presents - from.presents) * 1000.0 / wall;
+    s.frame_ms = spread(std::move(vblanks));
+    s.present_ms = spread(std::move(presents));
+    s.ee = (wall - (to.emulation_idle - from.emulation_idle) - iop) / frames;
+    s.iop = iop / frames;
+    s.vu1 = g_vu_thread ? (wall - (to.vu_idle - from.vu_idle)) / frames : 0.0;
+    s.gs = g_threads ? (wall - (to.render_idle - from.render_idle)) / frames : 0.0;
+    s.gpu = (to.gpu - from.gpu) / frames;
+    s.cpu = (to.cpu - from.cpu) * 1e5 / wall;
+    s.underruns = to.underruns - from.underruns;
+    s.silence_ms = frames_to_ms(to.silent - from.silent);
+    s.dropped_ms = frames_to_ms(to.dropped - from.dropped);
+    return s;
+}
+
+void print_stats(const char *label, const Stats &s) {
+    char audio[16] = "none";
+    if (g_audio) std::snprintf(audio, sizeof audio, "%.0f", frames_to_ms(audio_queued()));
+    std::fprintf(stderr,
+                 "[stats] %sframe=%llu fps=%.1f shown=%.1f frame_ms=%.2f/%.2f/%.2f present_ms=%.2f/%.2f/%.2f ee=%.2f iop=%.2f vu1=%.2f gs=%.2f gpu=%.2f audio_ms=%s "
+                 "underruns=%llu silence_ms=%.1f dropped_ms=%.1f\n",
+                 label, static_cast<unsigned long long>(s.frame), s.fps, s.shown, s.frame_ms.mean, s.frame_ms.p99, s.frame_ms.max, s.present_ms.mean, s.present_ms.p99,
+                 s.present_ms.max, s.ee, s.iop, s.vu1, s.gs, s.gpu, audio, static_cast<unsigned long long>(s.underruns), s.silence_ms, s.dropped_ms);
+}
+
+// The emulation thread writes the title once a second; show_speed sets it on the window's thread.
+std::mutex g_title_lock;
+std::string g_title;
+
+void publish_title(const Stats &s) {
+    char title[256];
+    std::snprintf(title, sizeof title, "ps2-web-recomp  %.1f fps  EE %.1f  IOP %.1f  VU1 %.1f  GS %.1f  GPU %.1f ms  CPU %.0f%%  RAM %.0f MB  audio %.0f ms  underruns %llu", s.fps,
+                  s.ee, s.iop, s.vu1, s.gs, s.gpu, s.cpu, resident_mb(), g_audio ? frames_to_ms(audio_queued()) : 0.0,
+                  static_cast<unsigned long long>(g_ring.underruns.load(std::memory_order_relaxed)));
+    const std::lock_guard<std::mutex> hold(g_title_lock);
+    g_title = title;
+}
+
+bool g_stats_started = false;
+Sample g_run_start, g_second_start;
+std::vector<float> g_run_vblanks, g_run_presents;
+
+// Called on the emulation thread after each vblank: one [stats] line per second of wall time.
+void report_stats() {
+    if (!g_stats_started) {
+        g_run_start = g_second_start = sample();
+        g_stats_started = true;
+        return;
+    }
+    if (ms_between(g_second_start.at, Clock::now()) < 1000.0) return;
+    const Sample now = sample();
+    std::vector<float> vblanks = g_vblanks.take(), presents = g_presents.take();
+    g_run_vblanks.insert(g_run_vblanks.end(), vblanks.begin(), vblanks.end());
+    g_run_presents.insert(g_run_presents.end(), presents.begin(), presents.end());
+    const Stats s = measure(g_second_start, now, std::move(vblanks), std::move(presents));
+    print_stats("", s);
+    publish_title(s);
+    g_second_start = now;
+}
+
+// The whole run, once the emulation has stopped.
+void report_total() {
+    if (!g_stats_started) return;
+    const Sample now = sample();
+    std::vector<float> vblanks = g_vblanks.take(), presents = g_presents.take();
+    g_run_vblanks.insert(g_run_vblanks.end(), vblanks.begin(), vblanks.end());
+    g_run_presents.insert(g_run_presents.end(), presents.begin(), presents.end());
+    print_stats("total ", measure(g_run_start, now, g_run_vblanks, g_run_presents));
+}
+
+void idle_pace() {
+    const Clock::time_point start = Clock::now();
+    pace();
+    add_ms(g_emulation_idle_ms, start);
+}
+
+// Runs just before each present.
+void show_speed() {
+    g_presents.mark();
+    g_gpu_ms.store(ps2::gpu_busy_ms(), std::memory_order_relaxed);
+    std::string title;
+    {
+        const std::lock_guard<std::mutex> hold(g_title_lock);
+        title.swap(g_title);
+    }
+    if (!title.empty()) SDL_SetWindowTitle(g_window, title.c_str());
 }
 
 void on_vblank() {
+    g_vblanks.mark();
     show_speed();
     poll();
     present();
-    pace();
+    idle_pace();
+    report_stats();
 }
 
 void queue_audio(const std::int16_t *samples, std::size_t frames) {
@@ -430,14 +589,19 @@ int run_window(const std::function<int()> &emulate) {
         ps2::g_options.on_vblank = on_vblank;
         const int result = emulate();
         finish_audio();
+        report_total();
         return result;
     }
+    g_threads = true;
     ps2::g_options.on_vblank = [] {
+        g_vblanks.mark();
         ps2::post_present();
-        pace();
+        idle_pace();
+        report_stats();
     };
     ps2::start_render_thread();
     if (!std::getenv("PS2_NO_VU_THREAD")) {
+        g_vu_thread = true;
         ps2::start_vu_thread();
         std::thread(ps2::run_vu_thread).detach();
     }
@@ -451,10 +615,15 @@ int run_window(const std::function<int()> &emulate) {
     const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> copy = show_pixels, none;
     while (!done.load()) {
         poll();
-        if (ps2::render_pending(g_gpu_present, g_gpu_present ? none : copy, show_speed, 8.0) == ps2::Rendered::idle) ps2::wait_render_work(4);
+        if (ps2::render_pending(g_gpu_present, g_gpu_present ? none : copy, show_speed, 8.0) == ps2::Rendered::idle) {
+            const Clock::time_point start = Clock::now();
+            ps2::wait_render_work(4);
+            add_ms(g_render_idle_ms, start);
+        }
     }
     emulation.join();
     finish_audio();
+    report_total();
     SDL_Quit();
     std::fflush(nullptr);
     std::_Exit(result);
