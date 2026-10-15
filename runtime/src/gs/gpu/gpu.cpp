@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -48,6 +50,14 @@ WGPUSurface g_surface = nullptr;
 WGPUTextureFormat g_surface_format = WGPUTextureFormat_Undefined;
 WGPUPresentMode g_present_mode = WGPUPresentMode_Fifo;
 std::uint32_t g_surface_width = 0, g_surface_height = 0;
+// The window's newest size, which present() rebuilds the swapchain to, and the rebuild state.
+// stats() reads the counts on the emulation thread while the main thread may still present.
+std::uint32_t g_wanted_width = 0, g_wanted_height = 0;
+constexpr std::chrono::milliseconds kRebuildGap{100}, kRebuildGapMax{800};
+bool g_outdated = false;
+std::chrono::steady_clock::time_point g_rebuilt_at;
+std::chrono::milliseconds g_rebuild_gap = kRebuildGap;
+std::atomic<std::uint64_t> g_rebuilds{0}, g_rebuild_us{0}, g_unshown{0};
 WGPURenderPipeline g_blit = nullptr;
 WGPUBindGroup g_blit_group = nullptr;
 WGPUBuffer g_blit_params = nullptr;
@@ -1641,6 +1651,9 @@ void stats() {
     std::fprintf(stderr, "[gpu] %llu submits, dispatches:", static_cast<unsigned long long>(g_submits));
     for (int i = 0; i < kPipelines; ++i) std::fprintf(stderr, " %s %llu", kEntryPoints[i], static_cast<unsigned long long>(g_dispatches[i]));
     std::fprintf(stderr, "\n");
+    if (g_surface)
+        std::fprintf(stderr, "[surface] %llu rebuilds in %.1f ms, %llu frames not shown\n", static_cast<unsigned long long>(g_rebuilds.load(std::memory_order_relaxed)),
+                     static_cast<double>(g_rebuild_us.load(std::memory_order_relaxed)) / 1000.0, static_cast<unsigned long long>(g_unshown.load(std::memory_order_relaxed)));
 }
 
 void configure_surface() {
@@ -1701,8 +1714,8 @@ bool attach_surface(const SurfaceTarget &target) {
         for (std::size_t i = 0; i < caps.presentModeCount; ++i)
             if (caps.presentModes[i] == wanted) g_present_mode = wanted;
     wgpuSurfaceCapabilitiesFreeMembers(caps);
-    g_surface_width = target.width;
-    g_surface_height = target.height;
+    g_surface_width = g_wanted_width = target.width;
+    g_surface_height = g_wanted_height = target.height;
     configure_surface();
 
     WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
@@ -1757,11 +1770,22 @@ bool attach_surface(const SurfaceTarget &target) {
     return g_blit != nullptr;
 }
 
-void resize_surface(std::uint32_t width, std::uint32_t height) {
-    if (!g_surface || (width == g_surface_width && height == g_surface_height)) return;
-    g_surface_width = width;
-    g_surface_height = height;
+void rebuild_surface() {
+    static const bool trace = std::getenv("PS2_TRACE_SURFACE") != nullptr;
+    const auto start = std::chrono::steady_clock::now();
     configure_surface();
+    g_rebuilt_at = std::chrono::steady_clock::now();
+    const auto took = std::chrono::duration_cast<std::chrono::microseconds>(g_rebuilt_at - start);
+    g_rebuilds.fetch_add(1, std::memory_order_relaxed);
+    g_rebuild_us.fetch_add(static_cast<std::uint64_t>(took.count()), std::memory_order_relaxed);
+    if (trace)
+        std::fprintf(stderr, "[surface] frame %llu: rebuilt at %ux%u in %.1f ms\n", static_cast<unsigned long long>(frame_count()), g_surface_width, g_surface_height,
+                     static_cast<double>(took.count()) / 1000.0);
+}
+
+void resize_surface(std::uint32_t width, std::uint32_t height) {
+    g_wanted_width = width;
+    g_wanted_height = height;
 }
 
 bool has_surface() { return g_surface != nullptr; }
@@ -1769,6 +1793,21 @@ bool has_surface() { return g_surface != nullptr; }
 bool present(const DisplaySource &src) {
     if (!g_surface) return false;
     flush_all();
+    // NVIDIA's Vulkan driver fails every acquire while the window's size differs from the
+    // swapchain's, and a resize changes the size dozens of times a second. A rebuild waits for the
+    // GPU to go idle and takes about 5 ms, so the swapchain follows the newest size at most every
+    // 100 ms, and frames go unshown in between while it is outdated. Rebuilds at an unchanged size
+    // that keep failing back off, doubling up to 800 ms. This runs before the blit parameters,
+    // which depend on the size.
+    const bool resized = g_wanted_width != g_surface_width || g_wanted_height != g_surface_height;
+    const std::chrono::milliseconds gap = resized ? kRebuildGap : g_rebuild_gap;
+    if ((resized || g_outdated) && std::chrono::steady_clock::now() - g_rebuilt_at >= gap) {
+        g_rebuild_gap = resized ? kRebuildGap : std::min(g_rebuild_gap * 2, kRebuildGapMax);
+        g_surface_width = g_wanted_width;
+        g_surface_height = g_wanted_height;
+        rebuild_surface();
+        g_outdated = false;
+    }
     const std::uint32_t current = field_base(g_field), previous = field_base(g_field + 1);
     static const bool weave_off = std::getenv("PS2_NO_DEINTERLACE") != nullptr;
     const bool blend = src.halved && g_have_previous && g_last_width == src.width && g_last_height == src.height && !weave_off;
@@ -1782,14 +1821,21 @@ bool present(const DisplaySource &src) {
     g_have_previous = true;
     g_last_width = src.width;
     g_last_height = src.height;
+    if (g_outdated) {
+        submit();
+        g_unshown.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
     WGPUSurfaceTexture st = WGPU_SURFACE_TEXTURE_INIT;
     wgpuSurfaceGetCurrentTexture(g_surface, &st);
     if (st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal && st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal) {
         if (st.texture) wgpuTextureRelease(st.texture);
         submit();
-        configure_surface();
+        g_unshown.fetch_add(1, std::memory_order_relaxed);
+        g_outdated = true;
         return true;
     }
+    g_rebuild_gap = kRebuildGap;
     WGPUTextureView target = wgpuTextureCreateView(st.texture, nullptr);
     submit(target);
 #ifndef __EMSCRIPTEN__
