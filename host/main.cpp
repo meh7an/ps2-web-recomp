@@ -24,7 +24,7 @@ int usage() {
                  "              [--disc image.iso] [--memcard card.ps2] [--pal | --ntsc] [--trace-syscalls] [--trace-io] [--trace-threads]\n"
                  "              [--trace-iop] [--trace-iop-hle] [--frames-dir dir] [--frame-every n]\n"
                  "              [--press frame:button[+button][:frames]]... [--window] [--fullscreen]\n"
-                 "              [--save-state frame:file] [--load-state file]\n");
+                 "              [--config file | --no-config] [--save-state frame:file] [--load-state file]\n");
     return 2;
 }
 
@@ -33,7 +33,10 @@ int usage() {
 int main(int argc, char **argv) {
     if (argc < 2) return usage();
     std::vector<std::string> args{argv[1]};
-    [[maybe_unused]] bool window = false, fullscreen = false;
+    [[maybe_unused]] bool window = false;
+#ifdef PS2_WINDOW
+    WindowOptions window_options;
+#endif
     std::string load_path;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -59,7 +62,9 @@ int main(int argc, char **argv) {
         }
 #ifdef PS2_WINDOW
         else if (a == "--window") window = true;
-        else if (a == "--fullscreen") window = fullscreen = true;
+        else if (a == "--fullscreen") window = window_options.fullscreen = true;
+        else if (a == "--config" && i + 1 < argc) window_options.config_path = argv[++i];
+        else if (a == "--no-config") window_options.use_config = false;
 #endif
         else if (a == "--frame-every" && i + 1 < argc) ps2::g_options.frame_every = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         else if (a == "--save-state" && i + 1 < argc) {
@@ -74,7 +79,7 @@ int main(int argc, char **argv) {
     }
 
 #ifdef PS2_WINDOW
-    if (window && !open_window(fullscreen)) return 1;
+    if (window && !open_window(window_options)) return 1;
 #endif
     register_generated_code();
     register_generated_vu();

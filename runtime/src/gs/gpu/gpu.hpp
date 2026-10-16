@@ -21,6 +21,7 @@ struct SurfaceTarget {
     void *surface;
     const char *selector;
     std::uint32_t width, height;
+    bool vsync, stretch;
 };
 
 Mode mode();

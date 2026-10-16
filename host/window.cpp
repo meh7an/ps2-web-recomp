@@ -1,5 +1,6 @@
 #include "window.hpp"
 
+#include "config.hpp"
 #include "input.hpp"
 #include "ps2/system.hpp"
 
@@ -20,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -42,24 +44,26 @@ static_assert(same_key(input::kKeyA, SDL_SCANCODE_A) && same_key(input::kKeyD, S
               same_key(input::kKeyRight, SDL_SCANCODE_RIGHT) && same_key(input::kKeyLeft, SDL_SCANCODE_LEFT) &&
               same_key(input::kKeyDown, SDL_SCANCODE_DOWN) && same_key(input::kKeyUp, SDL_SCANCODE_UP));
 
-struct PadBinding {
-    SDL_GameControllerButton button;
-    std::uint16_t mask;
-};
+namespace config = ps2::config;
 
-constexpr PadBinding kPadButtons[] = {
-    {SDL_CONTROLLER_BUTTON_A, input::kCross},          {SDL_CONTROLLER_BUTTON_B, input::kCircle},
-    {SDL_CONTROLLER_BUTTON_X, input::kSquare},         {SDL_CONTROLLER_BUTTON_Y, input::kTriangle},
-    {SDL_CONTROLLER_BUTTON_LEFTSHOULDER, input::kL1},  {SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, input::kR1},
-    {SDL_CONTROLLER_BUTTON_LEFTSTICK, input::kL3},     {SDL_CONTROLLER_BUTTON_RIGHTSTICK, input::kR3},
-    {SDL_CONTROLLER_BUTTON_BACK, input::kSelect},      {SDL_CONTROLLER_BUTTON_START, input::kStart},
-    {SDL_CONTROLLER_BUTTON_DPAD_UP, input::kUp},       {SDL_CONTROLLER_BUTTON_DPAD_DOWN, input::kDown},
-    {SDL_CONTROLLER_BUTTON_DPAD_LEFT, input::kLeft},   {SDL_CONTROLLER_BUTTON_DPAD_RIGHT, input::kRight},
-};
+// The settings file numbers controller buttons as SDL does; check each one.
+constexpr bool same_button(config::ControllerButton button, SDL_GameControllerButton sdl) { return static_cast<int>(button) == static_cast<int>(sdl); }
+static_assert(same_button(config::kButtonA, SDL_CONTROLLER_BUTTON_A) && same_button(config::kButtonB, SDL_CONTROLLER_BUTTON_B) &&
+              same_button(config::kButtonX, SDL_CONTROLLER_BUTTON_X) && same_button(config::kButtonY, SDL_CONTROLLER_BUTTON_Y) &&
+              same_button(config::kButtonBack, SDL_CONTROLLER_BUTTON_BACK) && same_button(config::kButtonGuide, SDL_CONTROLLER_BUTTON_GUIDE) &&
+              same_button(config::kButtonStart, SDL_CONTROLLER_BUTTON_START) && same_button(config::kButtonLeftStick, SDL_CONTROLLER_BUTTON_LEFTSTICK) &&
+              same_button(config::kButtonRightStick, SDL_CONTROLLER_BUTTON_RIGHTSTICK) &&
+              same_button(config::kButtonLeftShoulder, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) &&
+              same_button(config::kButtonRightShoulder, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) &&
+              same_button(config::kButtonDpadUp, SDL_CONTROLLER_BUTTON_DPAD_UP) && same_button(config::kButtonDpadDown, SDL_CONTROLLER_BUTTON_DPAD_DOWN) &&
+              same_button(config::kButtonDpadLeft, SDL_CONTROLLER_BUTTON_DPAD_LEFT) && same_button(config::kButtonDpadRight, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) &&
+              same_button(config::kButtonMisc1, SDL_CONTROLLER_BUTTON_MISC1) && same_button(config::kButtonPaddle1, SDL_CONTROLLER_BUTTON_PADDLE1) &&
+              same_button(config::kButtonPaddle2, SDL_CONTROLLER_BUTTON_PADDLE2) && same_button(config::kButtonPaddle3, SDL_CONTROLLER_BUTTON_PADDLE3) &&
+              same_button(config::kButtonPaddle4, SDL_CONTROLLER_BUTTON_PADDLE4) && same_button(config::kButtonTouchpad, SDL_CONTROLLER_BUTTON_TOUCHPAD) &&
+              static_cast<int>(config::kControllerButtons) == static_cast<int>(SDL_CONTROLLER_BUTTON_MAX));
 
-// No mouse button is bound by default: GoW2 has no camera to aim (spec 011).
-constexpr std::span<const input::MouseBinding> kMouseButtons{};
-constexpr input::Settings kInputSettings{};
+// The settings in force: the settings file's, or the defaults (spec 014).
+config::Config g_config;
 
 SDL_Window *g_window = nullptr;
 SDL_Renderer *g_renderer = nullptr;
@@ -73,8 +77,9 @@ std::vector<std::uint32_t> g_pixels;
 bool g_gpu_present = false;
 
 bool create_renderer() {
-    g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_ACCELERATED);
-    if (!g_renderer) g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_SOFTWARE);
+    const Uint32 vsync = g_config.display.vsync ? SDL_RENDERER_PRESENTVSYNC : 0u;
+    g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_ACCELERATED | vsync);
+    if (!g_renderer) g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_SOFTWARE | vsync);
     if (!g_renderer) {
         std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
         return false;
@@ -92,6 +97,8 @@ bool attach_gpu() {
     SDL_GetWindowSizeInPixels(g_window, &w, &h);
     target.width = static_cast<std::uint32_t>(w);
     target.height = static_cast<std::uint32_t>(h);
+    target.vsync = g_config.display.vsync;
+    target.stretch = g_config.display.aspect == config::Aspect::kStretch;
     switch (info.subsystem) {
 #if defined(SDL_VIDEO_DRIVER_X11)
     case SDL_SYSWM_X11:
@@ -159,12 +166,12 @@ void poll_port(int port) {
     if (port == 0) {
         int count = 0;
         const Uint8 *keys = SDL_GetKeyboardState(&count);
-        held.digital = input::from_keys(keys, static_cast<std::size_t>(count), input::kDefaultKeys);
-        held.digital |= input::from_mouse(SDL_GetMouseState(nullptr, nullptr), kMouseButtons);
+        held.digital = input::from_keys(keys, static_cast<std::size_t>(count), g_config.keys);
+        held.digital |= input::from_mouse(SDL_GetMouseState(nullptr, nullptr), g_config.mouse);
     }
     if (pad) {
-        for (const PadBinding &b : kPadButtons)
-            if (SDL_GameControllerGetButton(pad, b.button)) held.digital.buttons |= b.mask;
+        for (const config::ControllerBinding &b : g_config.controller)
+            if (SDL_GameControllerGetButton(pad, static_cast<SDL_GameControllerButton>(b.button))) held.digital |= b.target;
         held.controller = true;
         held.left_x = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX);
         held.left_y = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY);
@@ -176,7 +183,7 @@ void poll_port(int port) {
     rumble(port);
     static input::PadState last[2];
     static bool sent[2] = {};
-    const input::PadState state = input::resolve(held, kInputSettings);
+    const input::PadState state = input::resolve(held, g_config.input);
     if (sent[port] && state == last[port]) return;
     sent[port] = true;
     last[port] = state;
@@ -223,7 +230,8 @@ void show_pixels(const std::uint32_t *rgba, std::uint32_t w, std::uint32_t h) {
     if (w != g_tex_w || h != g_tex_h) {
         if (g_texture) SDL_DestroyTexture(g_texture);
         g_texture = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, static_cast<int>(w), static_cast<int>(h));
-        SDL_RenderSetLogicalSize(g_renderer, static_cast<int>(w), static_cast<int>(w) * 3 / 4);
+        // A 4:3 logical size letterboxes the picture; without one, it fills the window.
+        if (g_config.display.aspect == config::Aspect::k4x3) SDL_RenderSetLogicalSize(g_renderer, static_cast<int>(w), static_cast<int>(w) * 3 / 4);
         g_tex_w = w;
         g_tex_h = h;
     }
@@ -573,9 +581,32 @@ void finish_audio() {
                  frames_to_ms(g_ring.silent_frames.load()), frames_to_ms(g_ring.dropped_frames.load()));
 }
 
+// Reads the settings file, or writes the defaults there on first start. Each problem is printed,
+// and the setting it names keeps its default (spec 014).
+void load_settings(const WindowOptions &options) {
+    if (!options.use_config) return;
+#ifdef PS2_CONFIG
+    const std::filesystem::path path = options.config_path.empty() ? config::default_path() : std::filesystem::path(options.config_path);
+    config::Loaded loaded = config::load_or_create(path);
+    const std::u8string text = path.empty() ? std::u8string(u8"<no settings folder>") : path.u8string();
+    const char *where = reinterpret_cast<const char *>(text.c_str());
+    std::fprintf(stderr, "[config] %s%s\n", where, loaded.created ? " (written with the defaults)" : "");
+    for (const config::Problem &p : loaded.problems) {
+        const std::string setting = p.setting.empty() ? "" : p.setting + ": ";
+        if (p.line) std::fprintf(stderr, "[config] %s:%d: %s%s\n", where, p.line, setting.c_str(), p.reason.c_str());
+        else std::fprintf(stderr, "[config] %s: %s%s\n", where, setting.c_str(), p.reason.c_str());
+    }
+    g_config = std::move(loaded.config);
+#else
+    (void)options;
+    std::fprintf(stderr, "[config] built without toml++; using the defaults\n");
+#endif
 }
 
-bool open_window(bool fullscreen) {
+}
+
+bool open_window(const WindowOptions &options) {
+    load_settings(options);
     // Over Bluetooth, DualShock 4 and DualSense pads rumble only in SDL's enhanced report mode,
     // which these hints allow; over USB they always rumble.
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, "1");
@@ -584,8 +615,9 @@ bool open_window(bool fullscreen) {
         std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
         return false;
     }
+    const bool fullscreen = options.fullscreen || g_config.display.fullscreen;
     const Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0u);
-    g_window = SDL_CreateWindow("ps2-web-recomp", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 960, 720, flags);
+    g_window = SDL_CreateWindow("ps2-web-recomp", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, g_config.display.width, g_config.display.height, flags);
     if (!g_window) {
         std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
         return false;

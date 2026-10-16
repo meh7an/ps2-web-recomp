@@ -49,6 +49,7 @@ WGPUAdapter g_adapter = nullptr;
 WGPUSurface g_surface = nullptr;
 WGPUTextureFormat g_surface_format = WGPUTextureFormat_Undefined;
 WGPUPresentMode g_present_mode = WGPUPresentMode_Fifo;
+bool g_stretch = false;
 std::uint32_t g_surface_width = 0, g_surface_height = 0;
 // The window's newest size, which present() rebuilds the swapchain to, and the rebuild state.
 // stats() reads the counts on the emulation thread while the main thread may still present.
@@ -66,6 +67,12 @@ bool g_have_previous = false;
 std::uint32_t g_scale = 1, g_copy_words = 1u << 20, g_field_words = 1u << 19;
 
 std::uint32_t field_base(std::uint32_t field) { return g_copy_words + (field & 1u) * g_field_words; }
+
+// The picture's size on a w by h surface: the largest 4:3 that fits, or all of it when stretched.
+void picture_size(float w, float h, float &vw, float &vh) {
+    vw = g_stretch ? w : std::min(w, h * 4.0f / 3.0f);
+    vh = g_stretch ? h : vw * 3.0f / 4.0f;
+}
 
 bool g_timestamps = false;
 WGPUQuerySet g_queries = nullptr;
@@ -915,7 +922,8 @@ void submit(WGPUTextureView present_view = nullptr) {
         rd.colorAttachments = &color;
         WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
         const float w = static_cast<float>(g_surface_width), h = static_cast<float>(g_surface_height);
-        const float vw = std::min(w, h * 4.0f / 3.0f), vh = vw * 3.0f / 4.0f;
+        float vw = 0.0f, vh = 0.0f;
+        picture_size(w, h, vw, vh);
         wgpuRenderPassEncoderSetViewport(rp, (w - vw) * 0.5f, (h - vh) * 0.5f, vw, vh, 0.0f, 1.0f);
         wgpuRenderPassEncoderSetPipeline(rp, g_blit);
         wgpuRenderPassEncoderSetBindGroup(rp, 0, g_blit_group, 0, nullptr);
@@ -1709,11 +1717,14 @@ bool attach_surface(const SurfaceTarget &target) {
             g_surface_format = caps.formats[i];
             break;
         }
+    // Fifo waits for the display's refresh. Without vsync, Mailbox, else Immediate, never waits.
     g_present_mode = WGPUPresentMode_Fifo;
-    for (const WGPUPresentMode wanted : {WGPUPresentMode_Immediate, WGPUPresentMode_Mailbox})
-        for (std::size_t i = 0; i < caps.presentModeCount; ++i)
-            if (caps.presentModes[i] == wanted) g_present_mode = wanted;
+    if (!target.vsync)
+        for (const WGPUPresentMode wanted : {WGPUPresentMode_Immediate, WGPUPresentMode_Mailbox})
+            for (std::size_t i = 0; i < caps.presentModeCount; ++i)
+                if (caps.presentModes[i] == wanted) g_present_mode = wanted;
     wgpuSurfaceCapabilitiesFreeMembers(caps);
+    g_stretch = target.stretch;
     g_surface_width = g_wanted_width = target.width;
     g_surface_height = g_wanted_height = target.height;
     configure_surface();
@@ -1813,8 +1824,8 @@ bool present(const DisplaySource &src) {
     const bool blend = src.halved && g_have_previous && g_last_width == src.width && g_last_height == src.height && !weave_off;
     const std::uint32_t param = push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u, current});
     g_commands.push_back({kDisplay, (src.width * g_scale + 7) / 8, (src.height * g_scale + 7) / 8, param});
-    const float sw = static_cast<float>(g_surface_width), sh = static_cast<float>(g_surface_height);
-    const float vw = std::min(sw, sh * 4.0f / 3.0f), vh = vw * 3.0f / 4.0f;
+    float vw = 0.0f, vh = 0.0f;
+    picture_size(static_cast<float>(g_surface_width), static_cast<float>(g_surface_height), vw, vh);
     const std::uint32_t blit[8] = {src.width * g_scale, src.height * g_scale, current, previous, blend ? 1u : 0u, static_cast<std::uint32_t>(vw), static_cast<std::uint32_t>(vh), 0};
     wgpuQueueWriteBuffer(g_queue, g_blit_params, 0, blit, sizeof blit);
     ++g_field;

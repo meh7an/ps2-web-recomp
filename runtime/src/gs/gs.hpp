@@ -78,7 +78,7 @@ bool display(const DisplayRegs &regs, std::vector<std::uint32_t> &rgba, std::uin
 // Frame for hosts that draw it themselves, with interlaced fields blended like present(); may lag a frame.
 bool copy_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
 bool copy_frame(const DisplayRegs &regs, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
-bool attach_window(int kind, void *display, std::uint64_t window, void *surface, const char *selector, std::uint32_t width, std::uint32_t height);
+bool attach_window(int kind, void *display, std::uint64_t window, void *surface, const char *selector, std::uint32_t width, std::uint32_t height, bool vsync, bool stretch);
 void resize_window(std::uint32_t width, std::uint32_t height);
 bool present();
 bool present(const DisplayRegs &regs);

@@ -819,13 +819,13 @@ void vblank(bool start) {
 
 bool interlaced_odd_field() { return g_odd_field; }
 
-bool attach_window(int kind, void *display, std::uint64_t window, void *surface, const char *selector, std::uint32_t width, std::uint32_t height) {
+bool attach_window(int kind, void *display, std::uint64_t window, void *surface, const char *selector, std::uint32_t width, std::uint32_t height, bool vsync, bool stretch) {
 #ifdef PS2_GPU
     if (gpu::mode() != gpu::Mode::primary) return false;
-    const gpu::SurfaceTarget target{static_cast<gpu::SurfaceTarget::Kind>(kind), display, window, surface, selector, width, height};
+    const gpu::SurfaceTarget target{static_cast<gpu::SurfaceTarget::Kind>(kind), display, window, surface, selector, width, height, vsync, stretch};
     return gpu::attach_surface(target);
 #else
-    (void)kind, (void)display, (void)window, (void)surface, (void)selector, (void)width, (void)height;
+    (void)kind, (void)display, (void)window, (void)surface, (void)selector, (void)width, (void)height, (void)vsync, (void)stretch;
     return false;
 #endif
 }

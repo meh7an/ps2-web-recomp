@@ -89,6 +89,8 @@ struct WindowTarget {
     void *surface = nullptr;
     const char *selector = nullptr;
     std::uint32_t width = 0, height = 0;
+    // Present only on the display's refresh, and fill the window instead of keeping 4:3.
+    bool vsync = false, stretch = false;
 };
 
 // Lets the WebGPU renderer present straight to a window or canvas instead of handing frames back.
