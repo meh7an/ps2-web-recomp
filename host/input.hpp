@@ -47,12 +47,14 @@ struct Target {
 struct KeyBinding {
     std::uint16_t key;
     Target target;
+    bool operator==(const KeyBinding &) const = default;
 };
 
 // Mouse buttons by SDL's numbering: 1 left, 2 middle, 3 right, 4 and 5 the side buttons.
 struct MouseBinding {
     std::uint8_t button;
     Target target;
+    bool operator==(const MouseBinding &) const = default;
 };
 
 // PCSX2's keyboard layout: each key drives one input, so no press reaches the game twice.
@@ -68,6 +70,7 @@ inline constexpr std::array<KeyBinding, 24> kDefaultKeys{{
 struct Settings {
     double deadzone = 0.10;      // radial, as a share of the stick's range
     int trigger_threshold = 2000; // of 32767, before a trigger presses L2 or R2
+    bool operator==(const Settings &) const = default;
 };
 
 // One port's inputs for one poll. Controller values are in SDL's ranges: sticks -32768 to 32767,
